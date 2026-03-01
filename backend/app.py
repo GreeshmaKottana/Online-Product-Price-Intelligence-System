@@ -3,6 +3,8 @@ import uuid
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
+import cv2
+from preprocessing import process_image
 
 app = Flask(__name__)
 # Enable CORS so the React frontend can talk to this API
@@ -57,19 +59,29 @@ def upload_image():
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], secure_name)
         
         try:
-            # Store the image temporarily
+            # 1. Store the original image temporarily
             file.save(filepath)
             
-            # Return success response with the unique ID
+            # 2. Run the Preprocessing Pipeline
+            img_normalized, img_enhanced = process_image(filepath)
+            
+            # 3. Save the enhanced version to prove it worked 
+            # (OpenCV needs it converted back to BGR just for saving)
+            enhanced_filename = f"enhanced_{secure_name}"
+            enhanced_filepath = os.path.join(app.config['UPLOAD_FOLDER'], enhanced_filename)
+            cv2.imwrite(enhanced_filepath, cv2.cvtColor(img_enhanced, cv2.COLOR_RGB2BGR))
+            
+            # Return success response with both filenames
             return jsonify({
                 "status": "success",
-                "message": "Image uploaded successfully",
+                "message": "Image uploaded and preprocessed successfully!",
                 "image_id": image_id,
-                "filename": secure_name
-            }), 201 # HTTP 201: Created
+                "original_filename": secure_name,
+                "enhanced_filename": enhanced_filename
+            }), 201 
             
         except Exception as e:
-            return jsonify({"status": "error", "message": f"Could not save file: {str(e)}"}), 500
+            return jsonify({"status": "error", "message": f"Processing failed: {str(e)}"}), 500
 
 # Global Error Handler: Triggers automatically if a file exceeds 10MB
 @app.errorhandler(413)

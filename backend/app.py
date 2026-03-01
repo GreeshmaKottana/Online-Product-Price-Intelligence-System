@@ -5,10 +5,11 @@ from flask_cors import CORS
 from werkzeug.utils import secure_filename
 import cv2
 from preprocessing import process_image
+from model_engine import identify_product
 
 app = Flask(__name__)
 # Enable CORS so the React frontend can talk to this API
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 # --- Configuration ---
 # Create an 'uploads' folder in the same directory as app.py
@@ -62,22 +63,26 @@ def upload_image():
             # 1. Store the original image temporarily
             file.save(filepath)
             
-            # 2. Run the Preprocessing Pipeline
+            # 2. TASK 4: Run your OpenCV Preprocessing Pipeline
             img_normalized, img_enhanced = process_image(filepath)
             
-            # 3. Save the enhanced version to prove it worked 
-            # (OpenCV needs it converted back to BGR just for saving)
+            # Save the enhanced version to show the user later
             enhanced_filename = f"enhanced_{secure_name}"
             enhanced_filepath = os.path.join(app.config['UPLOAD_FOLDER'], enhanced_filename)
             cv2.imwrite(enhanced_filepath, cv2.cvtColor(img_enhanced, cv2.COLOR_RGB2BGR))
             
-            # Return success response with both filenames
+            # 3. TASK 5: Run the ResNet50 Deep Learning Model
+            # (We feed it the original filepath because ResNet has strict native requirements)
+            ml_results = identify_product(filepath)
+            
+            # 4. Return the ultimate combined response!
             return jsonify({
                 "status": "success",
-                "message": "Image uploaded and preprocessed successfully!",
+                "message": "Image preprocessed and analyzed successfully!",
                 "image_id": image_id,
                 "original_filename": secure_name,
-                "enhanced_filename": enhanced_filename
+                "enhanced_filename": enhanced_filename,
+                "analysis": ml_results
             }), 201 
             
         except Exception as e:

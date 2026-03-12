@@ -1,246 +1,549 @@
-from dotenv import load_dotenv
 import os
+import time
+import uuid
+from collections import defaultdict, deque
+from datetime import datetime
+from functools import wraps
+
+import cv2
+from dotenv import load_dotenv
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+from werkzeug.utils import secure_filename
+
+from crud import create_price, create_product, save_search
+from database import Price, Product, SearchHistory, db
 
 load_dotenv()
 
-import uuid
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from werkzeug.utils import secure_filename
-import cv2
-from preprocessing import process_image
-from model_engine import identify_product
-from scraper import fetch_all_prices
-from price_engine import compare_prices
-
 app = Flask(__name__)
-# Enable CORS so the React frontend can talk to this API
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
-# --- Configuration ---
-# Create an 'uploads' folder in the same directory as app.py
-UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
-# Allowed file extensions per Task 3 requirements
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'webp'}
+CACHE_TTL_SECONDS = int(os.getenv('COMPARE_CACHE_TTL', '300'))
+RATE_LIMIT_WINDOW_SECONDS = int(os.getenv('RATE_LIMIT_WINDOW_SECONDS', '60'))
+RATE_LIMIT_MAX_REQUESTS = int(os.getenv('RATE_LIMIT_MAX_REQUESTS', '30'))
+DEFAULT_PAGE_SIZE = 6
+MAX_PAGE_SIZE = 20
 
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-# File size validation: Max 10MB
-app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024 
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv(
+    'DATABASE_URL',
+    f"sqlite:///{os.path.join(BASE_DIR, 'price_oracle.db')}",
+)
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# Ensure the upload directory exists when the app starts
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-from database import db
-
-app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL")
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db.init_app(app)
 
 with app.app_context():
     db.create_all()
 
-# Helper function to check file extensions
+comparison_cache = {}
+rate_limit_log = defaultdict(deque)
+
+
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-# --- Endpoints ---
-@app.route('/api/upload-image', methods=['POST'])
-def upload_image():
 
+def get_client_key():
+    forwarded_for = request.headers.get('X-Forwarded-For')
+    if forwarded_for:
+        return forwarded_for.split(',')[0].strip()
+    return request.remote_addr or 'anonymous'
+
+
+def rate_limited():
+    def decorator(view_func):
+        @wraps(view_func)
+        def wrapped(*args, **kwargs):
+            client_key = get_client_key()
+            request_log = rate_limit_log[client_key]
+            now = time.time()
+
+            while request_log and now - request_log[0] > RATE_LIMIT_WINDOW_SECONDS:
+              request_log.popleft()
+
+            if len(request_log) >= RATE_LIMIT_MAX_REQUESTS:
+                return (
+                    jsonify(
+                        {
+                            'status': 'error',
+                            'message': 'Rate limit exceeded. Please try again shortly.',
+                        }
+                    ),
+                    429,
+                )
+
+            request_log.append(now)
+            return view_func(*args, **kwargs)
+
+        return wrapped
+
+    return decorator
+
+
+def parse_positive_int(value, default):
+    try:
+        parsed = int(value)
+        if parsed <= 0:
+            return default
+        return parsed
+    except (TypeError, ValueError):
+        return default
+
+
+def normalize_product_name(name):
+    return ' '.join((name or '').strip().lower().split())
+
+
+def clean_price_value(raw_price):
+    if raw_price is None:
+        return None
+
+    if isinstance(raw_price, (int, float)):
+        return round(float(raw_price), 2)
+
+    price_string = str(raw_price).replace(',', '')
+    filtered = ''.join(char for char in price_string if char.isdigit() or char == '.')
+
+    if not filtered:
+        return None
+
+    try:
+        return round(float(filtered), 2)
+    except ValueError:
+        return None
+
+
+def extract_shipping_cost(raw_shipping):
+    if raw_shipping is None:
+        return 0.0
+
+    if isinstance(raw_shipping, (int, float)):
+        return float(raw_shipping)
+
+    shipping_text = str(raw_shipping).lower()
+    if 'free' in shipping_text or 'pickup' in shipping_text:
+        return 0.0
+
+    return clean_price_value(raw_shipping) or 0.0
+
+
+def serialize_offer(raw_offer, rank=None):
+    price_value = clean_price_value(raw_offer.get('price'))
+    shipping_text = raw_offer.get('shipping') or 'Standard shipping'
+    shipping_cost = extract_shipping_cost(shipping_text)
+    rating_value = raw_offer.get('rating')
+    review_count = raw_offer.get('reviewCount') or raw_offer.get('review_count')
+
+    try:
+        rating_value = round(float(rating_value), 1) if rating_value not in (None, 'N/A') else None
+    except (TypeError, ValueError):
+        rating_value = None
+
+    if review_count is not None:
+        try:
+            review_count = int(review_count)
+        except (TypeError, ValueError):
+            review_count = None
+
+    shipping_type = raw_offer.get('shippingType')
+    if not shipping_type:
+        lowered_shipping = str(shipping_text).lower()
+        if 'pickup' in lowered_shipping:
+            shipping_type = 'pickup'
+        elif 'free' in lowered_shipping:
+            shipping_type = 'free'
+        else:
+            shipping_type = 'standard'
+
+    return {
+        'store': raw_offer.get('store') or 'Unknown store',
+        'name': raw_offer.get('name') or raw_offer.get('product_name') or 'Matched product',
+        'price': price_value,
+        'price_display': raw_offer.get('price_display')
+        or raw_offer.get('price')
+        or (f'${price_value:.2f}' if price_value is not None else 'N/A'),
+        'url': raw_offer.get('url') or '#',
+        'availability': raw_offer.get('availability') or 'Unknown',
+        'shipping': shipping_text,
+        'shipping_cost': round(shipping_cost, 2),
+        'shippingType': shipping_type,
+        'rating': rating_value,
+        'reviewCount': review_count,
+        'image': raw_offer.get('image'),
+        'trust': raw_offer.get('trust') or raw_offer.get('trustIndicators') or ['Verified seller'],
+        'rank': rank,
+    }
+
+
+def paginate_items(items, page, page_size):
+    total_items = len(items)
+    total_pages = max(1, (total_items + page_size - 1) // page_size)
+    page = min(max(page, 1), total_pages)
+    start = (page - 1) * page_size
+    end = start + page_size
+
+    return items[start:end], {
+        'page': page,
+        'page_size': page_size,
+        'total_items': total_items,
+        'total_pages': total_pages,
+        'has_next': page < total_pages,
+        'has_previous': page > 1,
+    }
+
+
+def get_or_create_product_record(product_name, image_url=''):
+    normalized_name = normalize_product_name(product_name)
+    existing = Product.query.filter(Product.name.ilike(product_name)).first()
+
+    if existing:
+        if image_url and not existing.image_url:
+            existing.image_url = image_url
+            db.session.commit()
+        return existing
+
+    return create_product(name=product_name, category=normalized_name or product_name, image_url=image_url)
+
+
+def persist_price_snapshot(product, offers):
+    for offer in offers:
+        if offer['price'] is None:
+            continue
+
+        create_price(
+            product.product_id,
+            offer['store'],
+            offer['price'],
+            offer['url'],
+        )
+
+
+def build_comparison_payload(product_name, offers, comparison):
+    best_offer = min(
+        (offer for offer in offers if offer['price'] is not None),
+        key=lambda offer: offer['price'] + offer['shipping_cost'],
+        default=None,
+    )
+
+    return {
+        'product': product_name,
+        'offers': offers,
+        'summary': {
+            'lowest_price': comparison.get('lowest_price'),
+            'highest_price': comparison.get('highest_price'),
+            'average_price': comparison.get('average_price'),
+            'best_store': best_offer['store'] if best_offer else None,
+            'offer_count': len(offers),
+        },
+        'generated_at': datetime.utcnow().isoformat() + 'Z',
+    }
+
+
+def fetch_comparison_data(product_name, force_refresh=False, image_url=''):
+    from price_engine import compare_prices
+    from scraper import fetch_all_prices
+
+    normalized_name = normalize_product_name(product_name)
+    cached_entry = comparison_cache.get(normalized_name)
+    now = time.time()
+
+    if (
+        not force_refresh
+        and cached_entry
+        and now - cached_entry['timestamp'] < CACHE_TTL_SECONDS
+    ):
+        return cached_entry['payload'], True
+
+    raw_results = fetch_all_prices(product_name)
+    comparison = compare_prices(raw_results)
+    offers = [
+        serialize_offer(offer, rank=index + 1)
+        for index, offer in enumerate(comparison.get('offers', []))
+    ]
+
+    payload = build_comparison_payload(product_name, offers, comparison)
+    comparison_cache[normalized_name] = {'payload': payload, 'timestamp': now}
+
+    product = get_or_create_product_record(product_name, image_url=image_url)
+    persist_price_snapshot(product, offers)
+
+    return payload, False
+
+
+def build_compare_response(payload, cache_hit, page, page_size, product_id=None):
+    paginated_offers, pagination = paginate_items(payload['offers'], page, page_size)
+
+    response = {
+        'status': 'success',
+        'product': payload['product'],
+        'summary': payload['summary'],
+        'offers': paginated_offers,
+        'pagination': pagination,
+        'cache': {
+            'hit': cache_hit,
+            'ttl_seconds': CACHE_TTL_SECONDS,
+            'generated_at': payload['generated_at'],
+        },
+    }
+
+    if product_id is not None:
+        response['product_id'] = product_id
+
+    return response
+
+
+OPENAPI_SPEC = {
+    'openapi': '3.0.0',
+    'info': {
+        'title': 'Price Oracle API',
+        'version': '1.0.0',
+        'description': 'Image upload, product recognition, price comparison, and price history endpoints.',
+    },
+    'paths': {
+        '/api/upload-image': {
+            'post': {
+                'summary': 'Upload a product image and identify the product.',
+            }
+        },
+        '/api/compare-prices': {
+            'get': {
+                'summary': 'Retrieve paginated comparison results for a product query.',
+            }
+        },
+        '/api/price-history': {
+            'get': {
+                'summary': 'Retrieve historical stored prices for a product.',
+            }
+        },
+    },
+}
+
+
+@app.route('/api/docs', methods=['GET'])
+def api_docs():
+    return jsonify(OPENAPI_SPEC)
+
+
+@app.route('/api/health', methods=['GET'])
+def healthcheck():
+    return jsonify({'status': 'ok'})
+
+
+@app.route('/api/upload-image', methods=['POST'])
+@rate_limited()
+def upload_image():
     if 'image' not in request.files:
-        return jsonify({
-            "status": "error",
-            "message": "No image uploaded"
-        }), 400
+        return jsonify({'status': 'error', 'message': 'No image uploaded.'}), 400
 
     file = request.files['image']
 
     if file.filename == '':
-        return jsonify({
-            "status": "error",
-            "message": "Empty filename"
-        }), 400
+        return jsonify({'status': 'error', 'message': 'Empty filename.'}), 400
 
     if not allowed_file(file.filename):
-        return jsonify({
-            "status": "error",
-            "message": "Invalid file format"
-        }), 400
+        return jsonify(
+            {
+                'status': 'error',
+                'message': 'Unsupported file format. Use JPEG, PNG, or WebP.',
+            }
+        ), 400
 
     image_id = str(uuid.uuid4())
-
-    ext = file.filename.rsplit('.', 1)[1].lower()
-    filename = secure_filename(f"{image_id}.{ext}")
-
+    extension = file.filename.rsplit('.', 1)[1].lower()
+    filename = secure_filename(f'{image_id}.{extension}')
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
 
     try:
-
         file.save(filepath)
 
-        img_normalized, img_enhanced = process_image(filepath)
+        from model_engine import identify_product
+        from preprocessing import process_image
 
-        enhanced_filename = f"enhanced_{filename}"
+        _, image_enhanced = process_image(filepath)
+        enhanced_filename = f'enhanced_{filename}'
         enhanced_filepath = os.path.join(app.config['UPLOAD_FOLDER'], enhanced_filename)
+        cv2.imwrite(enhanced_filepath, cv2.cvtColor(image_enhanced, cv2.COLOR_RGB2BGR))
 
-        cv2.imwrite(enhanced_filepath, cv2.cvtColor(img_enhanced, cv2.COLOR_RGB2BGR))
+        identification = identify_product(filepath)
+        if identification.get('status') != 'success':
+            return jsonify({'status': 'error', 'message': 'AI prediction failed.'}), 500
 
-        ml_results = identify_product(filepath)
+        product_name = identification.get('analysis', {}).get('category')
+        if not product_name:
+            return jsonify({'status': 'error', 'message': 'Unable to identify product.'}), 422
 
-        if ml_results["status"] != "success":
-            return jsonify({
-                "status": "error",
-                "message": "AI prediction failed"
-            }), 500
+        save_search('anonymous', product_name)
+        product = get_or_create_product_record(product_name, image_url=filename)
 
-        keyword = ml_results["analysis"]["category"]
-
-        if not keyword or len(keyword) < 2:
-            return jsonify({
-                "status": "error",
-                "message": "Invalid detected product"
-            }), 400
-
-        price_results = fetch_all_prices(keyword)
-
-        comparison = compare_prices(price_results)
-
-        return jsonify({
-            "status": "success",
-            "analysis": ml_results,
-            "price_results": price_results,
-            "comparison": comparison
-        })
-
-        from crud import create_product, create_price, save_search
-
-        save_search("anonymous", keyword)
-
-        product = create_product(
-            name=keyword,
-            category=keyword,
-            image_url=filename
+        return (
+            jsonify(
+                {
+                    'status': 'success',
+                    'image_id': image_id,
+                    'product_id': product.product_id,
+                    'analysis': identification,
+                    'upload': {
+                        'filename': filename,
+                        'enhanced_filename': enhanced_filename,
+                    },
+                }
+            ),
+            201,
         )
+    except Exception as exc:
+        return jsonify({'status': 'error', 'message': str(exc)}), 500
 
-        for item in price_results:
 
-            price_raw = item.get("price")
+@app.route('/api/compare-prices', methods=['GET'])
+@rate_limited()
+def compare_prices_endpoint():
+    product_name = request.args.get('product', '').strip()
+    if not product_name:
+        return jsonify({'status': 'error', 'message': 'Query parameter "product" is required.'}), 400
 
-            if not price_raw:
-                continue
+    page = parse_positive_int(request.args.get('page'), 1)
+    page_size = min(parse_positive_int(request.args.get('page_size'), DEFAULT_PAGE_SIZE), MAX_PAGE_SIZE)
+    force_refresh = request.args.get('force_refresh', 'false').lower() == 'true'
 
-            try:
-                price_clean = str(price_raw)
-                price_clean = price_clean.replace("₹", "")
-                price_clean = price_clean.replace(",", "")
-                price_clean = price_clean.replace("$", "")
-                price_clean = price_clean.strip()
+    try:
+        payload, cache_hit = fetch_comparison_data(product_name, force_refresh=force_refresh)
+        product = Product.query.filter(Product.name.ilike(product_name)).first()
+        response = build_compare_response(
+            payload,
+            cache_hit=cache_hit,
+            page=page,
+            page_size=page_size,
+            product_id=product.product_id if product else None,
+        )
+        return jsonify(response)
+    except Exception as exc:
+        return jsonify({'status': 'error', 'message': str(exc)}), 500
 
-                price_value = float(price_clean)
 
-            except Exception:
-                continue
+@app.route('/api/price-history', methods=['GET'])
+def price_history():
+    product_id = request.args.get('product_id')
+    page = parse_positive_int(request.args.get('page'), 1)
+    page_size = min(parse_positive_int(request.args.get('page_size'), 20), 50)
 
-            create_price(
-                product.product_id,
-                item.get("store"),
-                price_value,
-                item.get("url")
-            )
+    if not product_id:
+        return jsonify({'status': 'error', 'message': 'Query parameter "product_id" is required.'}), 400
 
-        return jsonify({
-            "status": "success",
-            "analysis": ml_results,
-            "price_results": price_results
-        }), 201
+    product = db.session.get(Product, product_id)
+    if not product:
+        return jsonify({'status': 'error', 'message': 'Product not found.'}), 404
 
-    except Exception as e:
+    records = (
+        Price.query.filter_by(product_id=product.product_id)
+        .order_by(Price.timestamp.desc())
+        .all()
+    )
 
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        }), 500
+    history_items = [
+        {
+            'price_id': record.price_id,
+            'store_name': record.store_name,
+            'price': record.price,
+            'product_url': record.product_url,
+            'timestamp': record.timestamp.isoformat() + 'Z',
+        }
+        for record in records
+    ]
 
-@app.route("/api/products", methods=["GET"])
+    paginated_records, pagination = paginate_items(history_items, page, page_size)
+
+    return jsonify(
+        {
+            'status': 'success',
+            'product': {
+                'product_id': product.product_id,
+                'name': product.name,
+                'category': product.category,
+                'image_url': product.image_url,
+            },
+            'history': paginated_records,
+            'pagination': pagination,
+        }
+    )
+
+
+@app.route('/api/products', methods=['GET'])
 def get_products():
-
-    from database import Product
-
-    products = Product.query.all()
-
-    result = []
-
-    for p in products:
-        result.append({
-            "product_id": p.product_id,
-            "name": p.name,
-            "category": p.category,
-            "image_url": p.image_url
-        })
-
+    products = Product.query.order_by(Product.product_id.desc()).all()
+    result = [
+        {
+            'product_id': product.product_id,
+            'name': product.name,
+            'category': product.category,
+            'image_url': product.image_url,
+        }
+        for product in products
+    ]
     return jsonify(result)
 
-@app.route("/api/prices/<int:product_id>", methods=["GET"])
+
+@app.route('/api/prices/<int:product_id>', methods=['GET'])
 def get_prices(product_id):
-
-    from database import Price
-
-    prices = Price.query.filter_by(product_id=product_id).all()
-
-    result = []
-
-    for p in prices:
-        result.append({
-            "store": p.store_name,
-            "price": p.price,
-            "timestamp": p.timestamp,
-            "url": p.product_url
-        })
-
+    prices = Price.query.filter_by(product_id=product_id).order_by(Price.timestamp.desc()).all()
+    result = [
+        {
+            'store': price.store_name,
+            'price': price.price,
+            'timestamp': price.timestamp.isoformat() + 'Z',
+            'url': price.product_url,
+        }
+        for price in prices
+    ]
     return jsonify(result)
 
-@app.route("/api/search-history", methods=["GET"])
+
+@app.route('/api/search-history', methods=['GET'])
 def get_search_history():
-
-    from database import db, SearchHistory
-
-    searches = db.session.query(SearchHistory).order_by(SearchHistory.timestamp.desc()).all()
-
-    result = []
-
-    for s in searches:
-        result.append({
-            "search_id": s.search_id,
-            "user_id": s.user_id,
-            "query": s.query,
-            "timestamp": str(s.timestamp)
-        })
-
+    searches = SearchHistory.query.order_by(SearchHistory.timestamp.desc()).all()
+    result = [
+        {
+            'search_id': search.search_id,
+            'user_id': search.user_id,
+            'query': search.query,
+            'timestamp': search.timestamp.isoformat() + 'Z',
+        }
+        for search in searches
+    ]
     return jsonify(result)
 
-@app.route("/api/search-history/<int:search_id>", methods=["DELETE"])
+
+@app.route('/api/search-history/<int:search_id>', methods=['DELETE'])
 def delete_search(search_id):
-
-    from database import db, SearchHistory
-
-    search = SearchHistory.query.get(search_id)
-
+    search = db.session.get(SearchHistory, search_id)
     if not search:
-        return jsonify({"error": "Search not found"}), 404
+        return jsonify({'error': 'Search not found'}), 404
 
     db.session.delete(search)
     db.session.commit()
 
-    return jsonify({"message": "Search deleted successfully"})
+    return jsonify({'message': 'Search deleted successfully'})
 
-# Global Error Handler: Triggers automatically if a file exceeds 10MB
+
 @app.errorhandler(413)
-def request_entity_too_large(error):
-    return jsonify({
-        "status": "error", 
-        "message": "File exceeds the 10MB size limit."
-    }), 413
+def request_entity_too_large(_error):
+    return (
+        jsonify(
+            {
+                'status': 'error',
+                'message': 'File exceeds the 10MB size limit.',
+            }
+        ),
+        413,
+    )
+
 
 if __name__ == '__main__':
     app.run(port=5000, debug=True, use_reloader=False)

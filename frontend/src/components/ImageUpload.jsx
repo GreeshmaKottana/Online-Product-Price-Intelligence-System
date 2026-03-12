@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState } from 'react';
 
 export default function ImageUpload() {
   const [imagePreview, setImagePreview] = useState(null);

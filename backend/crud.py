@@ -16,7 +16,7 @@ def create_product(name, category, image_url=""):
 
 
 def get_product(product_id):
-    return Product.query.get(product_id)
+    return db.session.get(Product, product_id)
 
 
 def get_all_products():
@@ -24,7 +24,7 @@ def get_all_products():
 
 
 def delete_product(product_id):
-    product = Product.query.get(product_id)
+    product = db.session.get(Product, product_id)
 
     if product:
         db.session.delete(product)

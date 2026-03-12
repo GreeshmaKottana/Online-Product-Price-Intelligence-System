@@ -41,13 +41,15 @@ def scrape_amazon(keyword):
             if title and price and link:
 
                 products.append({
-                    "store": "Amazon Scraper",
+                    "store": "Amazon India",
                     "name": title.text.strip(),
-                    "price": price.text.strip(),
+                    "price": f"₹{price.text.strip()}",
                     "url": "https://amazon.in" + link.get("href"),
                     "rating": rating.text if rating else "N/A",
                     "availability": "Check on Amazon",
-                    "shipping": "Varies"
+                    "shipping": "Delivery varies by PIN code",
+                    "shippingType": "standard",
+                    "trust": ["Marketplace seller", "Amazon fulfillment options"],
                 })
 
         return products

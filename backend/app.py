@@ -11,10 +11,11 @@ import cv2
 from preprocessing import process_image
 from model_engine import identify_product
 from scraper import fetch_all_prices
+from price_engine import compare_prices
 
 app = Flask(__name__)
 # Enable CORS so the React frontend can talk to this API
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
 # --- Configuration ---
 # Create an 'uploads' folder in the same directory as app.py
@@ -102,7 +103,15 @@ def upload_image():
             }), 400
 
         price_results = fetch_all_prices(keyword)
-        print("PRICE RESULTS:", price_results)
+
+        comparison = compare_prices(price_results)
+
+        return jsonify({
+            "status": "success",
+            "analysis": ml_results,
+            "price_results": price_results,
+            "comparison": comparison
+        })
 
         from crud import create_product, create_price, save_search
 
@@ -153,6 +162,78 @@ def upload_image():
             "message": str(e)
         }), 500
 
+@app.route("/api/products", methods=["GET"])
+def get_products():
+
+    from database import Product
+
+    products = Product.query.all()
+
+    result = []
+
+    for p in products:
+        result.append({
+            "product_id": p.product_id,
+            "name": p.name,
+            "category": p.category,
+            "image_url": p.image_url
+        })
+
+    return jsonify(result)
+
+@app.route("/api/prices/<int:product_id>", methods=["GET"])
+def get_prices(product_id):
+
+    from database import Price
+
+    prices = Price.query.filter_by(product_id=product_id).all()
+
+    result = []
+
+    for p in prices:
+        result.append({
+            "store": p.store_name,
+            "price": p.price,
+            "timestamp": p.timestamp,
+            "url": p.product_url
+        })
+
+    return jsonify(result)
+
+@app.route("/api/search-history", methods=["GET"])
+def get_search_history():
+
+    from database import db, SearchHistory
+
+    searches = db.session.query(SearchHistory).order_by(SearchHistory.timestamp.desc()).all()
+
+    result = []
+
+    for s in searches:
+        result.append({
+            "search_id": s.search_id,
+            "user_id": s.user_id,
+            "query": s.query,
+            "timestamp": str(s.timestamp)
+        })
+
+    return jsonify(result)
+
+@app.route("/api/search-history/<int:search_id>", methods=["DELETE"])
+def delete_search(search_id):
+
+    from database import db, SearchHistory
+
+    search = SearchHistory.query.get(search_id)
+
+    if not search:
+        return jsonify({"error": "Search not found"}), 404
+
+    db.session.delete(search)
+    db.session.commit()
+
+    return jsonify({"message": "Search deleted successfully"})
+
 # Global Error Handler: Triggers automatically if a file exceeds 10MB
 @app.errorhandler(413)
 def request_entity_too_large(error):
@@ -162,4 +243,4 @@ def request_entity_too_large(error):
     }), 413
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000, use_reloader=False)
+    app.run(port=5000, debug=True, use_reloader=False)

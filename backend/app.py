@@ -1,3 +1,8 @@
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
 import uuid
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -6,10 +11,6 @@ import cv2
 from preprocessing import process_image
 from model_engine import identify_product
 from scraper import fetch_all_prices
-from dotenv import load_dotenv
-import os
-
-load_dotenv()
 
 app = Flask(__name__)
 # Enable CORS so the React frontend can talk to this API
@@ -28,6 +29,16 @@ app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
 # Ensure the upload directory exists when the app starts
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+from database import db
+
+app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL")
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+db.init_app(app)
+
+with app.app_context():
+    db.create_all()
+
 # Helper function to check file extensions
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -35,65 +46,112 @@ def allowed_file(filename):
 # --- Endpoints ---
 @app.route('/api/upload-image', methods=['POST'])
 def upload_image():
-    # 1. Validate that the request contains the 'image' field
+
     if 'image' not in request.files:
-        return jsonify({"status": "error", "message": "No image part in the request"}), 400
-    
+        return jsonify({
+            "status": "error",
+            "message": "No image uploaded"
+        }), 400
+
     file = request.files['image']
-    
-    # 2. Validate that a file was actually selected
+
     if file.filename == '':
-        return jsonify({"status": "error", "message": "No selected file"}), 400
-        
-    # 3. Validate the file format
+        return jsonify({
+            "status": "error",
+            "message": "Empty filename"
+        }), 400
+
     if not allowed_file(file.filename):
         return jsonify({
-            "status": "error", 
-            "message": "Invalid file format. Only JPEG, PNG, and WebP are allowed."
-        }), 415 # Unsupported Media Type
+            "status": "error",
+            "message": "Invalid file format"
+        }), 400
 
-    # 4. Process and save the valid file
-    if file and allowed_file(file.filename):
-        # Generate a unique identifier (UUID) for the image
-        image_id = str(uuid.uuid4())
-        
-        # Extract the original extension and create a secure filename
-        ext = file.filename.rsplit('.', 1)[1].lower()
-        secure_name = secure_filename(f"{image_id}.{ext}")
-        
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], secure_name)
-        
-        try:
-            # 1. Store the original image temporarily
-            file.save(filepath)
-            
-            # 2. TASK 4: Run your OpenCV Preprocessing Pipeline
-            img_normalized, img_enhanced = process_image(filepath)
-            
-            # Save the enhanced version to show the user later
-            enhanced_filename = f"enhanced_{secure_name}"
-            enhanced_filepath = os.path.join(app.config['UPLOAD_FOLDER'], enhanced_filename)
-            cv2.imwrite(enhanced_filepath, cv2.cvtColor(img_enhanced, cv2.COLOR_RGB2BGR))
-            
-            # 3. TASK 5: Run the ResNet50 Deep Learning Model
-            # (We feed it the original filepath because ResNet has strict native requirements)
-            ml_results = identify_product(filepath)
+    image_id = str(uuid.uuid4())
 
-            if ml_results["status"] == "success":
-                keyword = ml_results["analysis"]["category"]
-                price_results = fetch_all_prices(keyword)
-            else:
-                price_results = []
-            
-            # 4. Return the ultimate combined response!
+    ext = file.filename.rsplit('.', 1)[1].lower()
+    filename = secure_filename(f"{image_id}.{ext}")
+
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+
+    try:
+
+        file.save(filepath)
+
+        img_normalized, img_enhanced = process_image(filepath)
+
+        enhanced_filename = f"enhanced_{filename}"
+        enhanced_filepath = os.path.join(app.config['UPLOAD_FOLDER'], enhanced_filename)
+
+        cv2.imwrite(enhanced_filepath, cv2.cvtColor(img_enhanced, cv2.COLOR_RGB2BGR))
+
+        ml_results = identify_product(filepath)
+
+        if ml_results["status"] != "success":
             return jsonify({
-                "status": "success",
-                "analysis": ml_results,
-                "price_results": price_results
-            }), 201
-            
-        except Exception as e:
-            return jsonify({"status": "error", "message": f"Processing failed: {str(e)}"}), 500
+                "status": "error",
+                "message": "AI prediction failed"
+            }), 500
+
+        keyword = ml_results["analysis"]["category"]
+
+        if not keyword or len(keyword) < 2:
+            return jsonify({
+                "status": "error",
+                "message": "Invalid detected product"
+            }), 400
+
+        price_results = fetch_all_prices(keyword)
+        print("PRICE RESULTS:", price_results)
+
+        from crud import create_product, create_price, save_search
+
+        save_search("anonymous", keyword)
+
+        product = create_product(
+            name=keyword,
+            category=keyword,
+            image_url=filename
+        )
+
+        for item in price_results:
+
+            price_raw = item.get("price")
+
+            if not price_raw:
+                continue
+
+            try:
+                price_clean = str(price_raw)
+                price_clean = price_clean.replace("₹", "")
+                price_clean = price_clean.replace(",", "")
+                price_clean = price_clean.replace("$", "")
+                price_clean = price_clean.strip()
+
+                price_value = float(price_clean)
+
+            except Exception:
+                continue
+
+            create_price(
+                product.product_id,
+                item.get("store"),
+                price_value,
+                item.get("url")
+            )
+
+        return jsonify({
+            "status": "success",
+            "analysis": ml_results,
+            "price_results": price_results
+        }), 201
+
+    except Exception as e:
+
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
 
 # Global Error Handler: Triggers automatically if a file exceeds 10MB
 @app.errorhandler(413)

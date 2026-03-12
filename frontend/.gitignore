@@ -24,3 +24,30 @@ dist-ssr
 *.sw?
 
 .env
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+.venv/
+
+# Backend uploads (user images)
+backend/uploads/
+
+# Test images
+backend/test_images/
+
+# Environment variables
+backend/.env
+
+# Database files (if created locally)
+*.db
+*.sqlite3
+
+# Docker
+*.pid
+
+# OS files
+Thumbs.db

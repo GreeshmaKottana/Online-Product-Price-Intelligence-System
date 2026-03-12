@@ -4,6 +4,7 @@ import time
 import random
 from scrapers.amazon_scraper import scrape_amazon
 
+
 RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
 
 def fetch_all_prices(keyword):
@@ -28,41 +29,53 @@ def fetch_all_prices(keyword):
     try:
 
         # request throttling
-        time.sleep(random.uniform(1,2))
+        time.sleep(random.uniform(1, 2))
 
         response = requests.get(url, headers=headers, params=querystring)
 
+        if response.status_code != 200:
+            print("API ERROR:", response.text)
+            return results
+
         data = response.json()
 
-        if "data" in data and "products" in data["data"]:
+        print("Amazon API response received")
 
-            for item in data["data"]["products"][:5]:
+        products = data.get("data", {}).get("products", [])
 
-                results.append({
-                    "store": "Amazon API",
-                    "name": item.get("product_title"),
-                    "price": item.get("product_price"),
-                    "url": item.get("product_url"),
-                    "availability": "Check on Amazon",
-                    "rating": item.get("product_star_rating","N/A"),
-                    "shipping": "Varies"
-                })
+        for item in products[:5]:
+
+            title = item.get("product_title")
+            price = item.get("product_price")
+            product_url = item.get("product_url")
+
+            if not title or not price:
+                continue
+
+            results.append({
+                "store": "Amazon API",
+                "name": title,
+                "price": price,
+                "url": product_url,
+                "availability": "Check on Amazon",
+                "rating": item.get("product_star_rating", "N/A"),
+                "shipping": "Varies"
+            })
 
     except Exception as e:
 
         print("Amazon API error:", e)
-
 
     # fallback scraper
     try:
 
         scraped_results = scrape_amazon(keyword)
 
-        results.extend(scraped_results)
+        if scraped_results:
+            results.extend(scraped_results)
 
     except Exception as e:
 
         print("Amazon scraper error:", e)
-
 
     return results

@@ -1,4 +1,3 @@
-import os
 import uuid
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -6,6 +5,11 @@ from werkzeug.utils import secure_filename
 import cv2
 from preprocessing import process_image
 from model_engine import identify_product
+from scraper import fetch_all_prices
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
 
 app = Flask(__name__)
 # Enable CORS so the React frontend can talk to this API
@@ -74,16 +78,19 @@ def upload_image():
             # 3. TASK 5: Run the ResNet50 Deep Learning Model
             # (We feed it the original filepath because ResNet has strict native requirements)
             ml_results = identify_product(filepath)
+
+            if ml_results["status"] == "success":
+                keyword = ml_results["analysis"]["category"]
+                price_results = fetch_all_prices(keyword)
+            else:
+                price_results = []
             
             # 4. Return the ultimate combined response!
             return jsonify({
                 "status": "success",
-                "message": "Image preprocessed and analyzed successfully!",
-                "image_id": image_id,
-                "original_filename": secure_name,
-                "enhanced_filename": enhanced_filename,
-                "analysis": ml_results
-            }), 201 
+                "analysis": ml_results,
+                "price_results": price_results
+            }), 201
             
         except Exception as e:
             return jsonify({"status": "error", "message": f"Processing failed: {str(e)}"}), 500
@@ -97,4 +104,4 @@ def request_entity_too_large(error):
     }), 413
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    app.run(debug=True, port=5000, use_reloader=False)
